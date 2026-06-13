@@ -2,12 +2,26 @@ create extension if not exists pgcrypto;
 create schema if not exists private;
 
 create or replace function public.touch_updated_at()
-returns trigger
-language plpgsql
-as $$
+returns trigger language plpgsql as $$
 begin
   new.updated_at = now();
   return new;
+end;
+$$;
+
+create or replace function public.create_policy_if_missing(policy_name text, table_name text, policy_sql text)
+returns void
+language plpgsql
+security definer
+set search_path = public
+as $$
+begin
+  if not exists (
+    select 1 from pg_policies
+    where schemaname = 'public' and tablename = table_name and policyname = policy_name
+  ) then
+    execute policy_sql;
+  end if;
 end;
 $$;
 
@@ -52,9 +66,7 @@ language sql
 security definer
 set search_path = public
 as $$
-  select organization_id
-  from public.organization_members
-  where user_id = (select auth.uid());
+  select organization_id from public.organization_members where user_id = (select auth.uid());
 $$;
 
 create table if not exists public.customers (
@@ -247,8 +259,6 @@ create table if not exists public.payments (
   id uuid primary key default gen_random_uuid(),
   organization_id uuid not null references public.organizations(id) on delete cascade,
   invoice_id uuid not null references public.invoices(id) on delete cascade,
-  payment_session_id uuid references public.payment_sessions(id) on delete set null,
-  payment_event_id uuid references public.payment_events(id) on delete set null,
   amount numeric(12,2) not null,
   currency text not null default 'EUR',
   payment_date timestamptz not null default now(),
@@ -257,13 +267,8 @@ create table if not exists public.payments (
   bank_transaction_id uuid,
   provider_key text,
   provider_payment_id text,
-  provider_fee numeric(12,2),
-  net_amount numeric(12,2),
   status text not null default 'succeeded' check (status in ('pending','succeeded','failed','cancelled','refunded')),
   raw_payload jsonb default '{}'::jsonb,
-  reconciliation_status text default 'unmatched' check (reconciliation_status in ('unmatched','matched','overpaid','underpaid','manually_matched')),
-  failure_code text,
-  failure_message text,
   created_at timestamptz default now()
 );
 
@@ -312,11 +317,7 @@ create index if not exists idx_webhook_provider_event on public.payment_webhook_
 create index if not exists idx_payments_invoice on public.payments (invoice_id, status);
 
 create or replace function public.ensure_default_payment_providers(target_org uuid)
-returns void
-language plpgsql
-security definer
-set search_path = public
-as $$
+returns void language plpgsql security definer set search_path = public as $$
 begin
   insert into public.payment_providers (organization_id, provider_key, provider_name, status, mode, supported_methods, settings)
   values
@@ -330,83 +331,59 @@ begin
   on conflict (organization_id, provider_key) do nothing;
 
   insert into public.payment_methods (organization_id, provider_id, method_key, display_name, sort_order, customer_description)
-  select target_org, id, 'mock', 'Testimaksu', 10, 'Käytössä vain testauksessa.'
-  from public.payment_providers where organization_id = target_org and provider_key = 'mock'
+  select target_org, id, 'mock', 'Testimaksu', 10, 'Käytössä vain testaukseen.' from public.payment_providers where organization_id = target_org and provider_key = 'mock'
   on conflict do nothing;
 
   insert into public.payment_methods (organization_id, provider_id, method_key, display_name, sort_order, customer_description)
-  select target_org, id, 'bank_transfer', 'Tilisiirto', 50, 'Maksa lasku IBANilla ja viitenumerolla.'
-  from public.payment_providers where organization_id = target_org and provider_key = 'bank_transfer'
+  select target_org, id, 'bank_transfer', 'Tilisiirto', 50, 'Maksa lasku IBANilla ja viitenumerolla.' from public.payment_providers where organization_id = target_org and provider_key = 'bank_transfer'
   on conflict do nothing;
 end;
 $$;
 
 create or replace function public.create_payment_link_for_invoice(target_invoice uuid)
-returns text
-language plpgsql
-security definer
-set search_path = public
-as $$
-declare
-  inv record;
-  token text;
-  app_url text;
+returns text language plpgsql security definer set search_path = public as $$
+declare inv record; token text;
 begin
   select * into inv from public.invoices where id = target_invoice;
-  if not found then
-    raise exception 'invoice not found';
-  end if;
-
+  if not found then raise exception 'invoice not found'; end if;
   perform public.ensure_default_payment_providers(inv.organization_id);
   token := encode(gen_random_bytes(32), 'hex');
-
   insert into public.payment_links (organization_id, invoice_id, public_token, status)
-  values (inv.organization_id, inv.id, token, 'active')
-  on conflict (public_token) do nothing;
-
-  update public.invoices
-  set payment_link = '/pay/' || token,
-      updated_at = now()
-  where id = inv.id;
-
+  values (inv.organization_id, inv.id, token, 'active');
+  update public.invoices set payment_link = '/pay/' || token, updated_at = now() where id = inv.id;
   insert into public.audit_logs (organization_id, action, entity_type, entity_id, metadata)
   values (inv.organization_id, 'payment_link_created', 'invoice', inv.id, jsonb_build_object('tokenTail', right(token, 6)));
-
   return token;
 end;
 $$;
 
-create trigger touch_organizations before update on public.organizations for each row execute function public.touch_updated_at();
-create trigger touch_customers before update on public.customers for each row execute function public.touch_updated_at();
-create trigger touch_products before update on public.products for each row execute function public.touch_updated_at();
-create trigger touch_invoices before update on public.invoices for each row execute function public.touch_updated_at();
-create trigger touch_payment_providers before update on public.payment_providers for each row execute function public.touch_updated_at();
-create trigger touch_payment_methods before update on public.payment_methods for each row execute function public.touch_updated_at();
-create trigger touch_payment_links before update on public.payment_links for each row execute function public.touch_updated_at();
-create trigger touch_payment_sessions before update on public.payment_sessions for each row execute function public.touch_updated_at();
-
 do $$
 declare t text;
 begin
+  foreach t in array array['organizations','customers','products','invoices','payment_providers','payment_methods','payment_links','payment_sessions'] loop
+    if not exists (select 1 from pg_trigger where tgname = 'touch_' || t) then
+      execute format('create trigger %I before update on public.%I for each row execute function public.touch_updated_at()', 'touch_' || t, t);
+    end if;
+  end loop;
+
   foreach t in array array['organizations','users','organization_members','customers','products','invoices','invoice_lines','payment_providers','payment_methods','payment_links','payment_sessions','payment_events','payment_webhook_deliveries','payments','audit_logs','email_events'] loop
     execute format('alter table public.%I enable row level security', t);
   end loop;
 end $$;
 
-create policy if not exists org_member_select_organizations on public.organizations for select to authenticated using (id in (select private.current_user_organization_ids()));
-create policy if not exists org_member_update_organizations on public.organizations for update to authenticated using (id in (select private.current_user_organization_ids())) with check (id in (select private.current_user_organization_ids()));
-create policy if not exists users_self_select on public.users for select to authenticated using (id = (select auth.uid()));
-create policy if not exists users_self_insert on public.users for insert to authenticated with check (id = (select auth.uid()));
-create policy if not exists members_org_select on public.organization_members for select to authenticated using (organization_id in (select private.current_user_organization_ids()));
-
-create policy if not exists customers_org_all on public.customers for all to authenticated using (organization_id in (select private.current_user_organization_ids())) with check (organization_id in (select private.current_user_organization_ids()));
-create policy if not exists products_org_all on public.products for all to authenticated using (organization_id in (select private.current_user_organization_ids())) with check (organization_id in (select private.current_user_organization_ids()));
-create policy if not exists invoices_org_all on public.invoices for all to authenticated using (organization_id in (select private.current_user_organization_ids())) with check (organization_id in (select private.current_user_organization_ids()));
-create policy if not exists payment_providers_org_all on public.payment_providers for all to authenticated using (organization_id in (select private.current_user_organization_ids())) with check (organization_id in (select private.current_user_organization_ids()));
-create policy if not exists payment_methods_org_all on public.payment_methods for all to authenticated using (organization_id in (select private.current_user_organization_ids())) with check (organization_id in (select private.current_user_organization_ids()));
-create policy if not exists payment_links_org_all on public.payment_links for all to authenticated using (organization_id in (select private.current_user_organization_ids())) with check (organization_id in (select private.current_user_organization_ids()));
-create policy if not exists payment_sessions_org_all on public.payment_sessions for all to authenticated using (organization_id in (select private.current_user_organization_ids())) with check (organization_id in (select private.current_user_organization_ids()));
-create policy if not exists payment_events_org_all on public.payment_events for all to authenticated using (organization_id in (select private.current_user_organization_ids())) with check (organization_id in (select private.current_user_organization_ids()));
-create policy if not exists payments_org_all on public.payments for all to authenticated using (organization_id in (select private.current_user_organization_ids())) with check (organization_id in (select private.current_user_organization_ids()));
-create policy if not exists audit_logs_org_select on public.audit_logs for select to authenticated using (organization_id in (select private.current_user_organization_ids()));
-create policy if not exists email_events_org_select on public.email_events for select to authenticated using (organization_id in (select private.current_user_organization_ids()));
+select public.create_policy_if_missing('org_member_select_organizations','organizations','create policy org_member_select_organizations on public.organizations for select to authenticated using (id in (select private.current_user_organization_ids()))');
+select public.create_policy_if_missing('org_member_update_organizations','organizations','create policy org_member_update_organizations on public.organizations for update to authenticated using (id in (select private.current_user_organization_ids())) with check (id in (select private.current_user_organization_ids()))');
+select public.create_policy_if_missing('users_self_select','users','create policy users_self_select on public.users for select to authenticated using (id = (select auth.uid()))');
+select public.create_policy_if_missing('users_self_insert','users','create policy users_self_insert on public.users for insert to authenticated with check (id = (select auth.uid()))');
+select public.create_policy_if_missing('members_org_select','organization_members','create policy members_org_select on public.organization_members for select to authenticated using (organization_id in (select private.current_user_organization_ids()))');
+select public.create_policy_if_missing('customers_org_all','customers','create policy customers_org_all on public.customers for all to authenticated using (organization_id in (select private.current_user_organization_ids())) with check (organization_id in (select private.current_user_organization_ids()))');
+select public.create_policy_if_missing('products_org_all','products','create policy products_org_all on public.products for all to authenticated using (organization_id in (select private.current_user_organization_ids())) with check (organization_id in (select private.current_user_organization_ids()))');
+select public.create_policy_if_missing('invoices_org_all','invoices','create policy invoices_org_all on public.invoices for all to authenticated using (organization_id in (select private.current_user_organization_ids())) with check (organization_id in (select private.current_user_organization_ids()))');
+select public.create_policy_if_missing('payment_providers_org_all','payment_providers','create policy payment_providers_org_all on public.payment_providers for all to authenticated using (organization_id in (select private.current_user_organization_ids())) with check (organization_id in (select private.current_user_organization_ids()))');
+select public.create_policy_if_missing('payment_methods_org_all','payment_methods','create policy payment_methods_org_all on public.payment_methods for all to authenticated using (organization_id in (select private.current_user_organization_ids())) with check (organization_id in (select private.current_user_organization_ids()))');
+select public.create_policy_if_missing('payment_links_org_all','payment_links','create policy payment_links_org_all on public.payment_links for all to authenticated using (organization_id in (select private.current_user_organization_ids())) with check (organization_id in (select private.current_user_organization_ids()))');
+select public.create_policy_if_missing('payment_sessions_org_all','payment_sessions','create policy payment_sessions_org_all on public.payment_sessions for all to authenticated using (organization_id in (select private.current_user_organization_ids())) with check (organization_id in (select private.current_user_organization_ids()))');
+select public.create_policy_if_missing('payment_events_org_all','payment_events','create policy payment_events_org_all on public.payment_events for all to authenticated using (organization_id in (select private.current_user_organization_ids())) with check (organization_id in (select private.current_user_organization_ids()))');
+select public.create_policy_if_missing('payments_org_all','payments','create policy payments_org_all on public.payments for all to authenticated using (organization_id in (select private.current_user_organization_ids())) with check (organization_id in (select private.current_user_organization_ids()))');
+select public.create_policy_if_missing('audit_logs_org_select','audit_logs','create policy audit_logs_org_select on public.audit_logs for select to authenticated using (organization_id in (select private.current_user_organization_ids()))');
+select public.create_policy_if_missing('email_events_org_select','email_events','create policy email_events_org_select on public.email_events for select to authenticated using (organization_id in (select private.current_user_organization_ids()))');
